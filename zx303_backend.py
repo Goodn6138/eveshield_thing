@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ZX303 Tracker Backend - Render-ready Flask app
-Receives TCP data from ZX303 GPS tracker, serves JSON API + simple frontend.
+ZX303 Tracker Backend - Render-ready
+Receives TCP data from ZX303 GPS tracker, serves web dashboard.
 """
 
 from flask import Flask, jsonify, render_template_string, request
@@ -19,6 +19,7 @@ FLASK_PORT = int(os.environ.get("PORT", 10000))
 
 # ==================== DATA STORE ====================
 devices = {}
+raw_packets = []
 
 # ==================== PACKET PARSER ====================
 
@@ -93,6 +94,32 @@ def parse_packet(raw_data):
     else:
         return None, f"UNKNOWN_0x{protocol:02x}", {"raw": raw_data.hex()}
 
+def store_event(imei, event, data):
+    now = datetime.datetime.now().isoformat()
+
+    if imei not in devices:
+        devices[imei] = {
+            "imei": imei,
+            "first_seen": now,
+            "last_seen": now,
+            "events": [],
+            "latest": {}
+        }
+
+    devices[imei]["last_seen"] = now
+    devices[imei]["events"].append({
+        "time": now,
+        "type": event,
+        "data": data
+    })
+
+    devices[imei]["events"] = devices[imei]["events"][-100:]
+
+    if event == "LOCATION":
+        devices[imei]["latest"] = data
+
+    print(f"[STORED] IMEI:{imei} | {event} | {json.dumps(data)}")
+
 # ==================== TCP SERVER ====================
 
 def tcp_server():
@@ -121,7 +148,13 @@ def handle_client(conn, addr):
                     break
 
                 buffer += chunk
-                print(f"[RAW] {chunk.hex()}")
+                raw_packets.append({
+                    "time": datetime.datetime.now().isoformat(),
+                    "source": f"tcp:{addr[0]}",
+                    "hex": chunk.hex()
+                })
+
+                print(f"[RAW TCP] {chunk.hex()}")
 
                 while len(buffer) >= 5:
                     header_idx = buffer.find(b'\x78\x78')
@@ -152,30 +185,7 @@ def handle_client(conn, addr):
                         current_imei = imei
 
                     if current_imei:
-                        now = datetime.datetime.now().isoformat()
-
-                        if current_imei not in devices:
-                            devices[current_imei] = {
-                                "imei": current_imei,
-                                "first_seen": now,
-                                "last_seen": now,
-                                "events": [],
-                                "latest": {}
-                            }
-
-                        devices[current_imei]["last_seen"] = now
-                        devices[current_imei]["events"].append({
-                            "time": now,
-                            "type": event,
-                            "data": data
-                        })
-
-                        devices[current_imei]["events"] = devices[current_imei]["events"][-100:]
-
-                        if event == "LOCATION":
-                            devices[current_imei]["latest"] = data
-
-                        print(f"[PARSED] IMEI:{current_imei} | {event} | {json.dumps(data)}")
+                        store_event(current_imei, event, data)
                     else:
                         print(f"[PARSED] NO_IMEI | {event} | {json.dumps(data)}")
 
@@ -224,6 +234,9 @@ HTML_TEMPLATE = """
         .api-info a { color: #00d4ff; }
         .status-online { color: #00ff88; }
         .status-offline { color: #ff4444; }
+        .setup-box { background: #1a1a0d; border: 1px solid #333300; border-radius: 6px; padding: 15px; margin: 20px 0; }
+        .setup-box code { background: #222; padding: 2px 6px; border-radius: 3px; color: #ffaa00; }
+        .setup-box h3 { color: #ffaa00; margin-bottom: 10px; }
     </style>
 </head>
 <body>
@@ -233,8 +246,17 @@ HTML_TEMPLATE = """
     {% if not devices %}
         <div class="no-data">
             <h2>Waiting for ZX303 connection...</h2>
-            <p>Set your tracker server to: <code>{{ request_host }}:5001</code></p>
-            <p>Via SMS: <code>adminip123456 {{ request_host }} 5001</code></p>
+        </div>
+
+        <div class="setup-box">
+            <h3>⚙️ Setup Instructions</h3>
+            <p><strong>Via Serial AT:</strong></p>
+            <p><code>AT+SERVER=1,"YOUR_SERVER_IP",5001,0</code></p>
+            <p>Then restart tracker</p>
+            <br>
+            <p><strong>Via SMS:</strong></p>
+            <p><code>adminip123456 YOUR_SERVER_IP 5001</code></p>
+            <p><code>reset123456</code></p>
         </div>
     {% endif %}
 
@@ -290,8 +312,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-raw_packets = []
-
 @app.route("/")
 def dashboard():
     five_min = (datetime.datetime.now() - datetime.timedelta(minutes=5)).isoformat()
@@ -299,8 +319,7 @@ def dashboard():
         HTML_TEMPLATE,
         devices=devices,
         server_time=datetime.datetime.now().isoformat()[:19],
-        five_min_ago=five_min,
-        request_host=request.host.split(":")[0]
+        five_min_ago=five_min
     )
 
 @app.route("/api/devices")
